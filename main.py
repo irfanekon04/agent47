@@ -1,14 +1,21 @@
 import argparse
 import os
 import re
+import sys
 from urllib.parse import urlparse
 
 from openai import OpenAI
 
+import providers
 from call_function import available_functions, call_function
 from config import BASE_URL, CONTEXT_TOKEN_LIMIT, MAX_ITERATIONS, MODEL
+from errors import TurnCancelled
+from providers import complete
+from renderer import HELP_TEXT, PlainRenderer
 from session import (
     Session,
+    compact_session,
+    estimate_tokens,
     list_sessions,
     load_session,
     maybe_compact,
@@ -17,15 +24,6 @@ from session import (
 )
 
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-
-HELP_TEXT = """Commands:
-  /help          Show this help
-  /new           Save this session and start a new one
-  /sessions      List saved sessions
-  /history       Show this session's turn, message, token, and compaction counts
-  /exit, /quit   Save and exit (Ctrl-D also works)
-
-Anything else is sent to the agent."""
 
 
 def build_client() -> OpenAI:
@@ -46,80 +44,96 @@ def build_client() -> OpenAI:
     )
 
 
-def assistant_message_to_dict(message) -> dict:
-    """Convert the SDK message object into a plain, JSON-serializable dict."""
-    data = {"role": "assistant", "content": message.content}
-
-    if message.tool_calls:
-        data["tool_calls"] = [
-            tool_call.model_dump(exclude_none=True) for tool_call in message.tool_calls
-        ]
-
-    if message.refusal:
-        data["refusal"] = message.refusal
-
-    return data
-
-
 def run_turn(
     client: OpenAI,
     session: Session,
     user_input: str,
-    verbose: bool = False,
+    renderer=None,
     context_limit: int = CONTEXT_TOKEN_LIMIT,
+    should_stop=None,
 ) -> bool:
     """Run the agent loop for one user message. Returns False on iteration limit."""
+    renderer = renderer or PlainRenderer()
     user_message = {"role": "user", "content": user_input}
     session.messages.append(user_message)
 
     try:
         for _ in range(MAX_ITERATIONS):
-            maybe_compact(client, session, context_limit, verbose)
+            if should_stop is not None and should_stop():
+                raise TurnCancelled()
 
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=session.messages,
-                # temperature=0
-                tools=available_functions,
+            maybe_compact(
+                client,
+                session,
+                context_limit,
+                renderer.verbose,
+                renderer,
             )
 
-            if response.usage is None:
-                if verbose:
-                    print("[tokens] provider did not return usage")
+            prompt_estimate = estimate_tokens(session.messages)
+
+            completion = complete(
+                client,
+                session.messages,
+                available_functions,
+                on_delta=renderer.assistant_delta,
+            )
+
+            if completion.prompt_tokens is None:
+                session.prompt_tokens += prompt_estimate
+                session.last_prompt_tokens = prompt_estimate
+                estimated = True
             else:
-                session.prompt_tokens += response.usage.prompt_tokens
-                session.completion_tokens += response.usage.completion_tokens
-                session.last_prompt_tokens = response.usage.prompt_tokens
+                session.prompt_tokens += completion.prompt_tokens
+                session.completion_tokens += completion.completion_tokens or 0
+                session.last_prompt_tokens = completion.prompt_tokens
+                estimated = False
 
-                if verbose:
-                    print(
-                        f"[tokens] prompt={response.usage.prompt_tokens} "
-                        f"completion={response.usage.completion_tokens} "
-                        f"(limit {context_limit})"
-                    )
+            message = completion.message
+            session.messages.append(message)
 
-            message = response.choices[0].message
-            session.messages.append(assistant_message_to_dict(message))
+            tool_calls = message.get("tool_calls") or []
+            renderer.assistant_end(
+                message.get("content") or "",
+                tool_calls=bool(tool_calls),
+            )
 
-            if not message.tool_calls:
-                print(f"\n{message.content or '(no response)'}\n")
+            renderer.tokens(
+                session.last_prompt_tokens,
+                completion.completion_tokens,
+                context_limit,
+                estimated,
+            )
+
+            if not tool_calls:
                 return True
 
-            for tool_call in message.tool_calls:
-                result_message = call_function(tool_call, verbose)
-                content = truncate_tool_result(result_message["content"])
+            for tool_call in tool_calls:
+                if should_stop is not None and should_stop():
+                    raise TurnCancelled()
+
+                function = tool_call.get("function") or {}
+                name = function.get("name") or "tool"
+                arguments = function.get("arguments") or "{}"
+                call_id = tool_call.get("id") or ""
+
+                renderer.tool_call(call_id, name, arguments)
+
+                result_message = call_function(name, arguments, call_id)
+                content = truncate_tool_result(str(result_message.get("content") or ""))
 
                 if not content:
                     raise RuntimeError("Tool call returned empty content")
 
                 result_message["content"] = content
-
-                if verbose:
-                    print(f"-> {content}")
+                renderer.tool_result(call_id, name, content)
 
                 session.messages.append(result_message)
 
-        print(f"Agent stopped: reached the maximum of {MAX_ITERATIONS} iterations for this turn.")
+        renderer.notice(
+            f"Agent stopped: reached the maximum of {MAX_ITERATIONS} "
+            "iterations for this turn."
+        )
         return False
 
     except BaseException:
@@ -134,8 +148,58 @@ def run_turn(
         raise
 
 
-def run_interactive(client: OpenAI, args: argparse.Namespace) -> None:
+def handle_command(
+    command: str,
+    client: OpenAI,
+    session: Session,
+    args: argparse.Namespace,
+    renderer,
+) -> tuple[Session, bool]:
+    """Handle a slash command. Returns the (possibly new) session and exit flag."""
+    if command in ("/exit", "/quit"):
+        return session, True
+
+    if command == "/help":
+        renderer.notice(HELP_TEXT)
+    elif command == "/new":
+        session.save()
+        session = Session(new_session_id())
+        renderer.notice(f"Started new session '{session.id}'.")
+    elif command == "/sessions":
+        list_sessions()
+    elif command == "/history":
+        turns = sum(1 for m in session.messages if m.get("role") == "user")
+        renderer.notice(
+            f"session '{session.id}': {turns} user turn(s), "
+            f"{len(session.messages)} messages, "
+            f"{session.compactions} compaction(s), "
+            f"last prompt {session.last_prompt_tokens} tokens, "
+            f"{session.prompt_tokens} prompt / "
+            f"{session.completion_tokens} completion tokens total"
+        )
+    elif command == "/compact":
+        try:
+            compacted = compact_session(
+                client,
+                session,
+                args.context_limit,
+                args.verbose,
+                renderer,
+            )
+        except Exception as exc:
+            renderer.error(f"compaction failed: {exc}")
+        else:
+            if not compacted:
+                renderer.notice("Nothing to compact yet.")
+    else:
+        renderer.notice(f"Unknown command '{command}'. Try /help.")
+
+    return session, False
+
+
+def run_plain_interactive(client: OpenAI, args: argparse.Namespace) -> None:
     session = load_session(args.session) if args.session else Session(new_session_id())
+    renderer = PlainRenderer(args.verbose)
 
     resumed = bool(args.session) and session.path.exists()
     action = "Resumed" if resumed else "Started"
@@ -161,37 +225,25 @@ def run_interactive(client: OpenAI, args: argparse.Namespace) -> None:
 
             if user_input.startswith("/"):
                 command = user_input.split(maxsplit=1)[0].lower()
-
-                if command in ("/exit", "/quit"):
+                session, should_exit = handle_command(
+                    command, client, session, args, renderer
+                )
+                if should_exit:
                     break
-                if command == "/help":
-                    print(HELP_TEXT)
-                elif command == "/new":
-                    session.save()
-                    session = Session(new_session_id())
-                    print(f"Started new session '{session.id}'.\n")
-                elif command == "/sessions":
-                    list_sessions()
-                elif command == "/history":
-                    turns = sum(1 for m in session.messages if m.get("role") == "user")
-                    print(
-                        f"session '{session.id}': {turns} user turn(s), "
-                        f"{len(session.messages)} messages, "
-                        f"{session.compactions} compaction(s), "
-                        f"last prompt {session.last_prompt_tokens} tokens, "
-                        f"{session.prompt_tokens} prompt / "
-                        f"{session.completion_tokens} completion tokens total"
-                    )
-                else:
-                    print(f"Unknown command '{command}'. Try /help.")
                 continue
 
             try:
-                run_turn(client, session, user_input, args.verbose, args.context_limit)
+                run_turn(
+                    client,
+                    session,
+                    user_input,
+                    renderer,
+                    args.context_limit,
+                )
             except KeyboardInterrupt:
                 print("\nInterrupted - this turn was discarded.\n")
             except Exception as exc:
-                print(f"\nError: {exc}\n")
+                renderer.error(str(exc))
 
             session.save()
     finally:
@@ -199,18 +251,53 @@ def run_interactive(client: OpenAI, args: argparse.Namespace) -> None:
         print(f"Session saved. Resume with: uv run main.py --session {session.id}")
 
 
+def run_tui(client: OpenAI, args: argparse.Namespace) -> None:
+    from tui import Agent47App
+
+    session = load_session(args.session) if args.session else Session(new_session_id())
+    app = Agent47App(
+        client=client,
+        session=session,
+        context_limit=args.context_limit,
+        verbose=args.verbose,
+    )
+    app.run()
+
+
+def run_interactive(client: OpenAI, args: argparse.Namespace) -> None:
+    use_tui = (
+        not args.plain
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+
+    if use_tui:
+        try:
+            run_tui(client, args)
+            return
+        except ImportError:
+            print("Textual is not installed; falling back to plain mode.")
+        except Exception as exc:
+            print(f"Could not start the TUI: {exc}")
+            print("Re-run with --plain to use the line-based interface.")
+            raise SystemExit(1)
+
+    run_plain_interactive(client, args)
+
+
 def run_once(client: OpenAI, args: argparse.Namespace) -> None:
     session = load_session(args.session) if args.session else Session(new_session_id())
+    renderer = PlainRenderer(args.verbose)
 
     try:
         completed = run_turn(
-            client, session, args.user_prompt, args.verbose, args.context_limit
+            client, session, args.user_prompt, renderer, args.context_limit
         )
     except KeyboardInterrupt:
         print("\nInterrupted.")
         raise SystemExit(130)
     except Exception as exc:
-        print(f"Error: {exc}")
+        renderer.error(str(exc))
         raise SystemExit(1)
 
     if args.session:
@@ -243,6 +330,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use the line-based interface instead of the full-screen TUI",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Wait for complete responses instead of streaming tokens",
+    )
     args = parser.parse_args()
 
     if args.session and not SESSION_ID_PATTERN.match(args.session):
@@ -252,6 +349,9 @@ def main() -> None:
 
     if args.context_limit < 1000:
         parser.error("--context-limit must be at least 1000 tokens")
+
+    if args.no_stream:
+        providers.STREAM_RESPONSES = False
 
     client = build_client()
 

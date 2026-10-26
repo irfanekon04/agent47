@@ -125,29 +125,46 @@ def load_session(session_id: str) -> Session:
     return session
 
 
-def list_sessions() -> None:
+def collect_sessions() -> list[dict]:
+    """Return saved sessions as plain dicts, sorted by session name."""
     if not SESSION_DIR.exists():
-        print("No saved sessions yet.")
-        return
+        return []
 
-    paths = sorted(SESSION_DIR.glob("*.json"))
-    if not paths:
-        print("No saved sessions yet.")
-        return
-
-    for path in paths:
+    sessions = []
+    for path in sorted(SESSION_DIR.glob("*.json")):
         try:
             data = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
-            print(f"- {path.stem} (unreadable)")
+            sessions.append({"id": path.stem, "unreadable": True})
             continue
 
-        message_count = len(data.get("messages") or [])
-        updated_at = data.get("updated_at", "unknown")
-        compactions = data.get("compactions", 0)
+        sessions.append(
+            {
+                "id": path.stem,
+                "updated_at": data.get("updated_at", "unknown"),
+                "messages": len(data.get("messages") or []),
+                "compactions": data.get("compactions", 0),
+                "model": data.get("model", ""),
+            }
+        )
+
+    return sessions
+
+
+def list_sessions() -> None:
+    sessions = collect_sessions()
+    if not sessions:
+        print("No saved sessions yet.")
+        return
+
+    for entry in sessions:
+        if entry.get("unreadable"):
+            print(f"- {entry['id']} (unreadable)")
+            continue
+
         print(
-            f"- {path.stem}  updated {updated_at}  "
-            f"({message_count} messages, {compactions} compactions)"
+            f"- {entry['id']}  updated {entry['updated_at']}  "
+            f"({entry['messages']} messages, {entry['compactions']} compactions)"
         )
 
 
@@ -281,6 +298,7 @@ def compact_session(
     session: Session,
     context_limit: int = CONTEXT_TOKEN_LIMIT,
     verbose: bool = False,
+    renderer=None,
 ) -> bool:
     """Summarize older turns into one persistent summary. Returns True if compacted."""
     # Never try to keep more than half the context verbatim, otherwise a low
@@ -298,7 +316,11 @@ def compact_session(
     try:
         summary = summarize(client, session, session.summary, older)
     except Exception as exc:
-        if verbose:
+        if renderer is not None:
+            renderer.notice(
+                f"Summarization failed ({exc}); using a fallback summary."
+            )
+        elif verbose:
             print(f"[compaction] summarization failed: {exc}")
         summary = fallback_summary(older)
 
@@ -308,10 +330,14 @@ def compact_session(
     session.last_prompt_tokens = 0
     session.compactions += 1
 
-    print(
-        f"[compacted {previous_tokens} -> {estimate_tokens(session.messages)} est. tokens: "
-        f"summarized {len(older)} messages, kept {len(recent)}]"
-    )
+    after_tokens = estimate_tokens(session.messages)
+    if renderer is not None:
+        renderer.compaction(previous_tokens, after_tokens, len(older), len(recent))
+    else:
+        print(
+            f"[compacted {previous_tokens} -> {after_tokens} est. tokens: "
+            f"summarized {len(older)} messages, kept {len(recent)}]"
+        )
 
     return True
 
@@ -321,10 +347,11 @@ def maybe_compact(
     session: Session,
     context_limit: int = CONTEXT_TOKEN_LIMIT,
     verbose: bool = False,
+    renderer=None,
 ) -> bool:
     if not needs_compaction(session, context_limit):
         return False
-    return compact_session(client, session, context_limit, verbose)
+    return compact_session(client, session, context_limit, verbose, renderer)
 
 
 def truncate_tool_result(content: str) -> str:
