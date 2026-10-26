@@ -1,6 +1,6 @@
 # Agent47
 
-Agent47 is a small, autonomous coding agent that runs in your terminal. It uses an LLM through OpenRouter to inspect a project, read and write files, execute Python code, and iterate until a coding task is complete.
+Agent47 is a small, autonomous coding agent with a full-screen terminal interface. It uses any OpenAI-compatible model (OpenRouter, Ollama, LM Studio, vLLM, …) to inspect a project, read and write files, execute Python code, and iterate until a coding task is complete.
 
 It is a learning project and a toy version of tools like Claude Code or Cursor's agent mode — **not** production software.
 
@@ -62,23 +62,23 @@ The provider is configurable. These optional variables override the OpenRouter d
 
 ## Usage
 
-Interactive mode (recommended). Each message keeps the conversation context:
+Start the full-screen interface:
 
 ```bash
 uv run main.py
 ```
 
-```
-Agent47 - Started session '20261026-143000' (model: openrouter/free)
-Compaction triggers at ~16000 prompt tokens. Type /help for commands, /exit to quit.
+The TUI keeps the transcript in a scrollable view, streams assistant text as it arrives, and renders each tool call as a collapsible `✓`/`✗` row. The status bar shows the model, session, context usage, and compaction count.
 
-you> There is a bug in the calculator. Find it, fix it, and verify the tests pass.
-...
-you> Nice. Now make the error message clearer.
-...
-you> /exit
-Session saved. Resume with: uv run main.py --session 20261026-143000
-```
+| Key | Action |
+| --- | --- |
+| `Enter` | Send the message |
+| `Ctrl+J` | Insert a newline |
+| `Esc` | Cancel the turn in progress |
+| `Ctrl+L` | Clear the transcript view (keeps the session) |
+| `Ctrl+Q` | Save and quit |
+
+In-session commands: `/help`, `/new`, `/sessions`, `/history`, `/compact`, `/exit`.
 
 Resume a session later with `--session <name-or-id>`:
 
@@ -92,20 +92,42 @@ A named session is created on first use, so you can keep returning to the same c
 uv run main.py --session calculator-refactor
 ```
 
-In-session commands: `/help`, `/new`, `/sessions`, `/history`, `/exit`.
+### Plain mode
 
-One-shot mode still works — pass a prompt and the agent exits when it is done:
+The original line-based interface is still available with `--plain`. It is also used automatically when the input or output is not a terminal, so piping and scripts keep working:
+
+```bash
+uv run main.py --plain
+```
+
+Both interfaces share the same session files, so you can switch between them freely:
+
+```
+Agent47 - Resumed session 'calculator-refactor' (model: openrouter/free @ https://openrouter.ai/api/v1)
+Compaction triggers at ~16000 prompt tokens. Type /help for commands, /exit to quit.
+
+>> There is a bug in the calculator. Find it, fix it, and verify the tests pass.
+...
+>> /exit
+Session saved. Resume with: uv run main.py --session calculator-refactor
+```
+
+### One-shot mode
+
+Pass a prompt and the agent exits when it is done:
 
 ```bash
 uv run main.py "Fix the bug in calculator/pkg/calculator.py"
 ```
 
-Add `--verbose` to see token usage, tool arguments, and tool output:
+Add `--verbose` to show token usage, tool arguments, and tool output in plain and one-shot mode:
 
 ```bash
 uv run main.py --verbose
 uv run main.py "Run the calculator tests and fix any failures" --verbose
 ```
+
+Responses stream by default. Pass `--no-stream` (or set `AGENT47_STREAM=0`) to wait for complete responses instead; this is useful for servers with broken streaming support.
 
 Sessions are stored as JSON in `.agent47/sessions/` (gitignored), including the full message history, summary, and token usage. Interrupted turns are discarded so the saved history stays valid.
 
@@ -127,7 +149,7 @@ uv run main.py --session big-refactor --context-limit 32000
 
 Set the limit below the model's context window and leave room for the response. The default of 16000 is conservative for most OpenRouter models; lower it if the free route picks a model with a small window.
 
-Compaction shows up as a one-line notice, and `/history` reports the count:
+Compaction appears as a notice in the transcript, and `/history` reports the count. In plain mode it looks like this:
 
 ```
 [compacted 18432 -> 6120 est. tokens: summarized 24 messages, kept 6]
@@ -210,14 +232,17 @@ The agent inspects the free-form calculator app, edits the broken source file, r
 
 ```
 agent47/
-├── main.py                 # CLI entry point and agent loop
+├── main.py                 # CLI entry point, agent loop, and command handling
+├── tui.py                  # Full-screen Textual interface
+├── renderer.py             # Agent events and the plain-text renderer
+├── providers.py            # Streaming chat completions and fallbacks
 ├── session.py              # Session persistence and context compaction
 ├── call_function.py        # Tool dispatch
 ├── prompts.py              # System prompt
 ├── config.py               # Provider, model, limits, and compaction settings
 ├── functions/              # Tool implementations and JSON schemas
 ├── calculator/             # Example project the agent operates on
-├── test_*.py               # Manual smoke tests (tools, session compaction)
+├── test_*.py               # Offline smoke tests (tools, providers, sessions, TUI)
 └── pyproject.toml
 ```
 
