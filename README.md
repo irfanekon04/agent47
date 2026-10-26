@@ -220,6 +220,8 @@ LM Studio works the same way: start its local server (default `http://localhost:
 
 Local models are convenient, private, and free to run, but a 9B model is still weaker than a frontier cloud model at long multi-step coding tasks. Expect more retries and occasional malformed tool calls; invalid JSON is returned to the model as a tool error so it can recover instead of crashing the turn.
 
+Some thinking models occasionally finish a turn with only reasoning and no final text. Agent47 retries once and never stores an empty assistant message. It also converts `null` message content to an empty string before every request, because strict servers such as Ollama reject `content: null` with `invalid message content type: <nil>`.
+
 ## Example
 
 ```bash
