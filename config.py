@@ -12,6 +12,10 @@ BASE_URL = os.environ.get("AGENT47_BASE_URL", "https://openrouter.ai/api/v1")
 
 MAX_ITERATIONS = 20
 
+# Stream assistant tokens as they arrive. Falls back to a blocking request if
+# the provider rejects streaming.
+STREAM_RESPONSES = os.environ.get("AGENT47_STREAM", "1") != "0"
+
 # Compaction: summarize older turns once a prompt grows past this many tokens.
 CONTEXT_TOKEN_LIMIT = 16_000
 
