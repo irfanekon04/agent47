@@ -22,7 +22,7 @@ class Completion:
 
 def assistant_message_to_dict(message) -> dict:
     """Convert the SDK message object into a plain, JSON-serializable dict."""
-    data = {"role": "assistant", "content": message.content}
+    data = {"role": "assistant", "content": message.content or ""}
 
     if message.tool_calls:
         data["tool_calls"] = [
@@ -35,6 +35,24 @@ def assistant_message_to_dict(message) -> dict:
     return data
 
 
+def normalize_messages(messages: list[dict]) -> list[dict]:
+    """Make history safe for strict OpenAI-compatible servers.
+
+    Several local servers (notably Ollama) reject ``content: null`` with
+    "invalid message content type: <nil>", so empty content is always sent as
+    an empty string.
+    """
+    normalized = []
+
+    for message in messages:
+        item = dict(message)
+        if item.get("content") is None:
+            item["content"] = ""
+        normalized.append(item)
+
+    return normalized
+
+
 def complete(
     client: OpenAI,
     messages: list[dict],
@@ -42,6 +60,8 @@ def complete(
     on_delta=None,
 ) -> Completion:
     """Run one completion, streaming when possible."""
+    messages = normalize_messages(messages)
+
     if not STREAM_RESPONSES:
         return _blocking(client, messages, tools)
 
@@ -129,7 +149,7 @@ def _streaming(client: OpenAI, messages: list[dict], tools: list[dict], on_delta
             if function.arguments:
                 entry["function"]["arguments"] += function.arguments
 
-    message: dict = {"role": "assistant", "content": "".join(text_parts) or None}
+    message: dict = {"role": "assistant", "content": "".join(text_parts)}
 
     if tool_calls:
         ordered = []

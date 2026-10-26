@@ -38,6 +38,36 @@ def new_session_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def sanitize_messages(messages: list[dict]) -> list[dict]:
+    """Repair histories saved by older builds or non-conforming models.
+
+    ``content: null`` is rejected by strict OpenAI-compatible servers such as
+    Ollama, and an assistant message with neither text nor tool calls carries
+    no information. Null content is converted to a string, and empty assistant
+    messages are dropped.
+    """
+    cleaned = []
+
+    for message in messages:
+        item = dict(message)
+        if item.get("content") is None:
+            item["content"] = ""
+
+        if item.get("role") == "assistant":
+            text = item.get("content")
+            if (
+                isinstance(text, str)
+                and not text.strip()
+                and not item.get("tool_calls")
+                and not item.get("refusal")
+            ):
+                continue
+
+        cleaned.append(item)
+
+    return cleaned
+
+
 @dataclass
 class Session:
     id: str
@@ -51,6 +81,7 @@ class Session:
     updated_at: str = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        self.messages = sanitize_messages(self.messages)
         self.refresh_system_message()
 
     def system_content(self) -> str:

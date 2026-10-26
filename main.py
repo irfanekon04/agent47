@@ -56,6 +56,7 @@ def run_turn(
     renderer = renderer or PlainRenderer()
     user_message = {"role": "user", "content": user_input}
     session.messages.append(user_message)
+    empty_retries = 0
 
     try:
         for _ in range(MAX_ITERATIONS):
@@ -90,14 +91,32 @@ def run_turn(
                 estimated = False
 
             message = completion.message
-            session.messages.append(message)
-
+            content = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
-            renderer.assistant_end(
-                message.get("content") or "",
-                tool_calls=bool(tool_calls),
-            )
 
+            # Some local models occasionally finish a turn with only reasoning
+            # and no answer. Retrying once usually produces a real response;
+            # never store the empty assistant message, because strict servers
+            # reject it on the next request.
+            if not content.strip() and not tool_calls:
+                renderer.tokens(
+                    session.last_prompt_tokens,
+                    completion.completion_tokens,
+                    context_limit,
+                    estimated,
+                )
+                if empty_retries == 0:
+                    empty_retries += 1
+                    renderer.notice("The model returned an empty response; retrying once.")
+                    continue
+                renderer.notice(
+                    "The model returned another empty response. "
+                    "Try rephrasing the request or switching models."
+                )
+                return True
+
+            session.messages.append(message)
+            renderer.assistant_end(content, tool_calls=bool(tool_calls))
             renderer.tokens(
                 session.last_prompt_tokens,
                 completion.completion_tokens,

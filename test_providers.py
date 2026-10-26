@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 import providers
-from providers import complete
+from providers import complete, normalize_messages
 
 
 def chunk(content=None, tool_calls=None, usage=None, has_choice=True):
@@ -94,6 +94,24 @@ def main() -> None:
     assert deltas == []
     assert [call.get("stream", False) for call in client.calls] == [True, False]
     assert result.prompt_tokens == 7
+
+    # Strict local servers reject null content, so it is normalized away
+    # without mutating the caller's history.
+    original = [
+        {"role": "assistant", "content": None},
+        {"role": "tool", "tool_call_id": "c1", "content": None},
+        {"role": "user", "content": "hi"},
+    ]
+    normalized = normalize_messages(original)
+    assert normalized[0]["content"] == ""
+    assert normalized[1]["content"] == ""
+    assert original[0]["content"] is None
+
+    client = FakeClient(stream_chunks=[chunk("ok")])
+    complete(client, original, [])
+    sent = client.calls[0]["messages"]
+    assert sent[0]["content"] == "" and sent[1]["content"] == ""
+    assert original[0]["content"] is None
 
     print("All provider checks passed.")
 

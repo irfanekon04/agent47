@@ -11,6 +11,7 @@ from session import (
     load_session,
     maybe_compact,
     needs_compaction,
+    sanitize_messages,
     truncate_tool_result,
 )
 
@@ -128,6 +129,22 @@ def main() -> None:
         assert not maybe_compact(FakeSummarizer(), small, 16_000)
 
         assert compact_session(FakeSummarizer(), small, 16_000) is False
+
+        # Old or non-conforming histories are repaired on load: null content
+        # becomes a string and empty assistant turns are dropped.
+        repaired = sanitize_messages(
+            [
+                {"role": "system", "content": "system"},
+                {"role": "assistant", "content": None},
+                {"role": "user", "content": None},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+                {"role": "tool", "tool_call_id": "c1", "content": None},
+            ]
+        )
+        assert repaired[0]["content"] == "system"
+        assert repaired[1] == {"role": "user", "content": ""}
+        assert repaired[2]["role"] == "assistant" and repaired[2]["tool_calls"]
+        assert repaired[3]["content"] == ""
 
     print("All session/compaction checks passed.")
 
