@@ -17,7 +17,22 @@ available_functions = [
 
 def call_function(tool_call, verbose: bool = False) -> dict:
     function_name = tool_call.function.name
-    function_args = json.loads(tool_call.function.arguments or "{}")
+
+    try:
+        function_args = json.loads(tool_call.function.arguments or "{}")
+    except json.JSONDecodeError as exc:
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": f"Error: invalid JSON in tool arguments: {exc}",
+        }
+
+    if not isinstance(function_args, dict):
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": "Error: tool arguments must be a JSON object",
+        }
 
     if verbose:
         print(f" - Calling function: {function_name}({function_args})")
@@ -40,7 +55,14 @@ def call_function(tool_call, verbose: bool = False) -> dict:
 
     function_args["working_directory"] = "./calculator"
 
-    result =function_map[function_name](**function_args)
+    try:
+        result = function_map[function_name](**function_args)
+    except Exception as exc:
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": f"Error: {function_name} failed: {exc}",
+        }
 
     return {
     "role": "tool",
